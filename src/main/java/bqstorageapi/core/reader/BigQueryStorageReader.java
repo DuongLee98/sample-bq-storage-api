@@ -4,13 +4,18 @@ import bqstorageapi.api.StorageReader;
 import bqstorageapi.config.ClientConfig;
 import bqstorageapi.config.ReadOptions;
 import bqstorageapi.config.RetryConfig;
+import bqstorageapi.handler.BatchHandler;
+import bqstorageapi.handler.ValueMapper;
 import bqstorageapi.model.Page;
 import bqstorageapi.model.PagedResult;
 import bqstorageapi.model.QueryMetrics;
 
-import bqstorageapi.sink.BatchSink;
+import bqstorageapi.handler.BatchSink;
 import com.google.api.gax.core.FixedCredentialsProvider;
+import com.google.api.gax.retrying.RetrySettings;
+import com.google.api.gax.rpc.ApiException;
 import com.google.api.gax.rpc.ServerStream;
+import com.google.api.gax.rpc.StatusCode;
 import com.google.auth.oauth2.GoogleCredentials;
 import com.google.auth.oauth2.ServiceAccountCredentials;
 import com.google.cloud.bigquery.storage.v1.*;
@@ -39,6 +44,19 @@ public class BigQueryStorageReader implements StorageReader, AutoCloseable {
     private final ReadOptions defaultReadOpts;
     private final BigQueryReadClient readClient;
 
+    private static RetrySettings toGaxRetrySettings(RetryConfig cfg) {
+        var builder = RetrySettings.newBuilder()
+                .setMaxAttempts(cfg.maxAttempts)
+                .setInitialRetryDelay(org.threeten.bp.Duration.ofMillis(cfg.initialBackoff.toMillis()))
+                .setRetryDelayMultiplier(cfg.backoffMultiplier)
+                .setMaxRetryDelay(org.threeten.bp.Duration.ofMillis(cfg.maxBackoff.toMillis()));
+        if (cfg.overallTimeout != null) {
+            builder.setTotalTimeout(org.threeten.bp.Duration.ofMillis(cfg.overallTimeout.toMillis()));
+        }
+        return builder.build();
+    }
+
+
     BigQueryStorageReader(ClientConfig clientCfg, RetryConfig retryCfg, ReadOptions defaultReadOpts) {
         this.clientCfg = Objects.requireNonNull(clientCfg, "clientCfg");
         this.retryCfg = Objects.requireNonNull(retryCfg, "retryCfg");
@@ -56,10 +74,23 @@ public class BigQueryStorageReader implements StorageReader, AutoCloseable {
             } else {
                 creds = GoogleCredentials.getApplicationDefault();
             }
-            BigQueryReadSettings settings = BigQueryReadSettings.newBuilder()
-                    .setCredentialsProvider(FixedCredentialsProvider.create(creds))
-                    // TODO: map RetryConfig -> RetrySettings nếu cần tinh chỉnh ở GAX
-                    .build();
+
+            RetrySettings gaxRetry = toGaxRetrySettings(this.retryCfg);
+
+            BigQueryReadSettings.Builder builder = BigQueryReadSettings.newBuilder()
+                    .setCredentialsProvider(FixedCredentialsProvider.create(creds));
+
+            // Áp cho createReadSession
+            builder.createReadSessionSettings()
+                    .setRetrySettings(gaxRetry)
+                    .setRetryableCodes(this.retryCfg.retryableCodes);
+
+            // Áp cho readRows
+            builder.readRowsSettings()
+                    .setRetrySettings(gaxRetry)
+                    .setRetryableCodes(this.retryCfg.retryableCodes);
+
+            BigQueryReadSettings settings = builder.build();
             return BigQueryReadClient.create(settings);
         } catch (IOException e) {
             throw new IllegalStateException("Cannot create BigQueryReadClient", e);
@@ -78,148 +109,69 @@ public class BigQueryStorageReader implements StorageReader, AutoCloseable {
         return "projects/" + clientCfg.projectId + "/datasets/" + dataset + "/tables/" + tableName;
     }
 
-    private ReadSession newSession(String table, ReadOptions use,
-                                   String singleColumn, List<String> moreColumns, String sqlFilter) {
-
+    private ReadSession newSession(
+            String table,
+            ReadOptions use,
+            String singleColumn,
+            List<String> moreColumns,
+            String sqlFilter
+    ) {
         ReadSession.TableReadOptions.Builder ro = ReadSession.TableReadOptions.newBuilder();
 
-        // de-duplicate fields
+        // De-duplicate selected fields
         var selected = new java.util.LinkedHashSet<String>();
-        if (use.columns != null) selected.addAll(use.columns);
+        if (use.columns != null) {
+            for (String c : use.columns) if (c != null && !c.isBlank()) selected.add(c);
+        }
         if (singleColumn != null && !singleColumn.isBlank()) selected.add(singleColumn);
         if (moreColumns != null) {
-            for (String c : moreColumns) {
-                if (c != null && !c.isBlank()) selected.add(c);
-            }
+            for (String c : moreColumns) if (c != null && !c.isBlank()) selected.add(c);
         }
         if (!selected.isEmpty()) ro.addAllSelectedFields(selected);
 
-        // gộp filter
-        String f1 = (use.rowRestriction != null && !use.rowRestriction.isBlank()) ? use.rowRestriction : null;
-        String f2 = (sqlFilter != null && !sqlFilter.isBlank()) ? sqlFilter : null;
-        if (f1 != null && f2 != null) ro.setRowRestriction("(" + f1 + ") AND (" + f2 + ")");
-        else if (f1 != null) ro.setRowRestriction(f1);
-        else if (f2 != null) ro.setRowRestriction(f2);
+        // Merge filters
+        String base  = (use.rowRestriction != null && !use.rowRestriction.isBlank()) ? use.rowRestriction : null;
+        String extra = (sqlFilter != null && !sqlFilter.isBlank()) ? sqlFilter : null;
+        if (base != null && extra != null) ro.setRowRestriction("(" + base + ") AND (" + extra + ")");
+        else if (base != null)             ro.setRowRestriction(base);
+        else if (extra != null)            ro.setRowRestriction(extra);
 
-        // tạm thời chỉ AVRO
-        return readClient.createReadSession(
-                CreateReadSessionRequest.newBuilder()
-                        .setParent("projects/" + clientCfg.projectId)
-                        .setReadSession(ReadSession.newBuilder()
-                                .setTable(tablePath(table))
-                                .setDataFormat(DataFormat.AVRO) // ép AVRO ở v1
-                                .setReadOptions(ro.build())
-                                .build())
-                        .setMaxStreamCount(Math.max(1, use.maxStreams))
-                        .build()
-        );
+        // Build request (format AVRO cho v1)
+        ReadSession.Builder sessionBuilder = ReadSession.newBuilder()
+                .setTable(tablePath(table))
+                .setDataFormat(DataFormat.AVRO)
+                .setReadOptions(ro.build());
+
+        CreateReadSessionRequest req = CreateReadSessionRequest.newBuilder()
+                .setParent("projects/" + clientCfg.projectId)
+                .setReadSession(sessionBuilder.build())
+                .setMaxStreamCount(Math.max(1, use.maxStreams))
+                .build();
+
+        return readClient.createReadSession(req);
     }
 
+    // ở trong BigQueryStorageReader
+    private boolean isRetryable(Throwable t) {
+        if (!(t instanceof ApiException)) return false;
+        StatusCode.Code c = ((ApiException) t).getStatusCode().getCode();
+        return retryCfg.retryableCodes.contains(c);
+    }
 
-//    private void processStreams(
-//            List<ReadStream> streams,
-//            Schema avroSchema,
-//            long maxRows,                 // đổi sang long
-//            QueryMetrics m,
-//            RecordHandler handler
-//    ) throws IOException {
-//        long remaining = (maxRows > 0) ? maxRows : Long.MAX_VALUE;
-//
-//        for (int si = 0; si < streams.size() && remaining > 0; si++) {
-//            ReadStream stream = streams.get(si);
-//            long streamBytes = 0L;
-//            long streamRows  = 0L;
-//
-//            ServerStream<ReadRowsResponse> responses = readClient.readRowsCallable().call(
-//                    ReadRowsRequest.newBuilder().setReadStream(stream.getName()).build()
-//            );
-//
-//            for (ReadRowsResponse resp : responses) {
-//                streamBytes += resp.getAvroRows().getSerializedBinaryRows().size();
-//
-//                List<GenericRecord> recs = AvroUtils.decodeChunk(resp, avroSchema); // bắt IOException ở ngoài nếu muốn
-//
-//                for (GenericRecord gr : recs) {
-//                    streamRows++;
-//                    if (!handler.onRecord(gr)) { remaining = 0; break; }
-//                    if (--remaining <= 0) break;
-//                }
-//                if (remaining <= 0) break;
-//            }
-//
-//            m.pages++;
-//            m.rows += streamRows;               // m.rows đã là long → ok
-//            m.totalBytesProcessed += streamBytes;
-//        }
-//    }
-
-//    private void processStreamsParallel(
-//            List<ReadStream> streams,
-//            Schema avroSchema,
-//            long maxRows,                  // 0/neg = không giới hạn
-//            QueryMetrics m,
-//            RecordHandler handler,
-//            int workers                    // số thread muốn dùng (<= số stream)
-//    ) throws ExecutionException, InterruptedException {
-//        if (streams.isEmpty()) return;
-//
-//        final AtomicLong remaining = new AtomicLong(maxRows > 0 ? maxRows : Long.MAX_VALUE);
-//        final int poolSize = Math.min(workers <= 0 ? 1 : workers, streams.size());
-//        ExecutorService exec = Executors.newFixedThreadPool(poolSize);
-//        List<Future<?>> futures = new ArrayList<>(streams.size());
-//
-//        for (ReadStream stream : streams) {
-//            futures.add(exec.submit(() -> {
-//                long streamBytes = 0L;
-//                long streamRows  = 0L;
-//
-//                // Nếu đã đủ rows thì bỏ qua stream này sớm
-//                if (remaining.get() <= 0) return null;
-//
-//                ServerStream<ReadRowsResponse> responses = readClient.readRowsCallable().call(
-//                        ReadRowsRequest.newBuilder().setReadStream(stream.getName()).build()
-//                );
-//
-//                for (ReadRowsResponse resp : responses) {
-//                    if (remaining.get() <= 0) break;
-//
-//                    streamBytes += resp.getAvroRows().getSerializedBinaryRows().size();
-//
-//                    List<GenericRecord> recs = AvroUtils.decodeChunk(resp, avroSchema);
-//
-//                    for (GenericRecord gr : recs) {
-//                        if (remaining.get() <= 0) break;
-//
-//                        // Gọi handler trước rồi mới trừ remaining, để handler có thể quyết định dừng
-//                        boolean cont = handler.onRecord(gr);
-//                        if (!cont) {
-//                            remaining.set(0);
-//                            break;
-//                        }
-//                        long left = remaining.decrementAndGet();
-//                        streamRows++;
-//                        if (left <= 0) break;
-//                    }
-//                }
-//
-//                // Cập nhật metrics (đơn giản: sync trên m)
-//                synchronized (m) {
-//                    m.pages++; // coi mỗi stream là 1 "page"
-//                    m.rows += streamRows;
-//                    m.totalBytesProcessed += streamBytes;
-//                }
-//                return null;
-//            }));
-//        }
-//
-//        // Đợi tất cả xong (hoặc có thể cancel khi remaining==0)
-//        exec.shutdown();
-//
-//        // nếu có exception trong task, ném ra (tuỳ chọn)
-//        for (Future<?> f : futures) {
-//            f.get();
-//        }
-//    }
+    private long calcBackoffMs(int attempt) {
+        // attempt: 1,2,3,...
+        double mult = Math.pow(retryCfg.backoffMultiplier, Math.max(0, attempt - 1));
+        long delay = (long) Math.min(
+                retryCfg.maxBackoff.toMillis(),
+                retryCfg.initialBackoff.toMillis() * mult
+        );
+        if (retryCfg.jitter) {
+            long half = delay / 2;
+            long span = Math.max(1, delay - half);
+            return half + (long)(Math.random() * span);
+        }
+        return delay;
+    }
 
     private void processStreamsParallelBatch(
             List<ReadStream> streams,
@@ -245,66 +197,102 @@ public class BigQueryStorageReader implements StorageReader, AutoCloseable {
                 long streamBytes = 0L;
                 long streamRows  = 0L;
 
+                // buffer batch cục bộ cho từng stream (tránh lock)
                 List<GenericRecord> batch = new ArrayList<>(Math.max(1, targetBatchRows));
                 long batchApproxBytes = 0L;
 
                 if (remaining.get() <= 0) return null;
 
-                ServerStream<ReadRowsResponse> responses = readClient.readRowsCallable().call(
-                        ReadRowsRequest.newBuilder().setReadStream(stream.getName()).build()
-                );
+                long offset = 0L;          // <--- số row đã xử lý trong stream, dùng để resume
+                int attempts = 0;
 
-                for (ReadRowsResponse resp : responses) {
-                    if (remaining.get() <= 0) break;
-
-                    // dùng size() để tránh copy payload
-                    long payloadSize = resp.getAvroRows().getSerializedBinaryRows().size();
-                    long rc = resp.getRowCount();
-
-                    streamBytes += payloadSize;
-
-                    List<GenericRecord> recs = AvroUtils.decodeChunk(resp, avroSchema);
-                    long perRec = (rc > 0 ? Math.max(1L, payloadSize / rc) : 0L);
-
-                    for (GenericRecord gr : recs) {
+                // vòng đời đọc 1 stream với retry
+                while (true) {
+                    try {
                         if (remaining.get() <= 0) break;
 
-                        batch.add(gr);
-                        batchApproxBytes += perRec;
+                        ReadRowsRequest req = ReadRowsRequest.newBuilder()
+                                .setReadStream(stream.getName())
+                                .setOffset(offset)           // <--- resume từ offset
+                                .build();
 
-                        long left = remaining.decrementAndGet();
-                        streamRows++;
+                        ServerStream<ReadRowsResponse> responses = readClient.readRowsCallable().call(req);
 
-                        boolean reachRows  = (targetBatchRows > 0 && batch.size() >= targetBatchRows);
-                        boolean reachBytes = (batchBytesThreshold > 0 && batchApproxBytes >= batchBytesThreshold);
+                        for (ReadRowsResponse resp : responses) {
+                            if (remaining.get() <= 0) break;
 
-                        if (reachRows || reachBytes) {
-                            boolean cont = handler.onBatch(batch, batchApproxBytes);
-                            batch = new ArrayList<>(Math.max(1, targetBatchRows));
-                            batchApproxBytes = 0L;
-                            if (!cont) { remaining.set(0); break; }
+                            long payloadSize = resp.getAvroRows().getSerializedBinaryRows().size();
+                            long rc = resp.getRowCount();
+
+                            streamBytes += payloadSize;
+
+                            List<GenericRecord> recs = AvroUtils.decodeChunk(resp, avroSchema);
+                            long perRec = (rc > 0 ? Math.max(1L, payloadSize / rc) : 0L);
+
+                            for (GenericRecord gr : recs) {
+                                if (remaining.get() <= 0) break;
+
+                                batch.add(gr);
+                                batchApproxBytes += perRec;
+
+                                offset++;        // <--- đã xử lý xong 1 row trong stream
+                                streamRows++;
+
+                                long left = remaining.decrementAndGet();
+
+                                boolean reachRows  = (targetBatchRows > 0 && batch.size() >= targetBatchRows);
+                                boolean reachBytes = (batchBytesThreshold > 0 && batchApproxBytes >= batchBytesThreshold);
+
+                                if (reachRows || reachBytes) {
+                                    boolean cont = handler.onBatch(batch, batchApproxBytes);
+                                    batch = new ArrayList<>(Math.max(1, targetBatchRows));
+                                    batchApproxBytes = 0L;
+                                    if (!cont) { remaining.set(0); break; }
+                                }
+
+                                if (left <= 0) {
+                                    // đủ maxRows -> flush phần còn lại rồi dừng
+                                    if (!batch.isEmpty()) {
+                                        handler.onBatch(batch, batchApproxBytes);
+                                        batch.clear();
+                                        batchApproxBytes = 0L;
+                                    }
+                                    remaining.set(0);
+                                    break;
+                                }
+                            }
                         }
 
-                        if (left <= 0) {
-                            // flush phần còn lại trước khi dừng vì đủ maxRows
+                        // nếu đi hết responses mà không lỗi -> stream DONE
+                        break;
+
+                    } catch (Throwable t) {
+                        attempts++;
+                        if (!isRetryable(t) || attempts >= retryCfg.maxAttempts) {
+                            // hết cơ hội retry -> flush phần còn dư để khỏi mất dữ liệu đã thu
                             if (!batch.isEmpty()) {
                                 handler.onBatch(batch, batchApproxBytes);
                                 batch.clear();
                                 batchApproxBytes = 0L;
                             }
-                            remaining.set(0);
-                            break;
+                            // ném lỗi để fail task stream này
+                            throw (t instanceof RuntimeException) ? (RuntimeException) t : new RuntimeException(t);
                         }
+                        // backoff rồi thử lại, offset giữ nguyên (resume từ chỗ dở)
+                        long sleepMs = calcBackoffMs(attempts);
+                        try { Thread.sleep(sleepMs); }
+                        catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw ie; }
+                        // quay lại while để reopen từ offset
                     }
                 }
 
-                // LUÔN flush batch còn dư bất kể remaining (kể cả remaining==0)
+                // LUÔN flush batch còn dư (nếu chưa flush ở trên)
                 if (!batch.isEmpty()) {
                     handler.onBatch(batch, batchApproxBytes);
                 }
 
                 synchronized (m) {
-                    m.pages++;
+                    m.pages++; // mỗi stream = 1 "page"
                     m.rows += streamRows;
                     m.totalBytesProcessed += streamBytes;
                 }
@@ -322,7 +310,7 @@ public class BigQueryStorageReader implements StorageReader, AutoCloseable {
             String table,
             String column,
             ReadOptions opts,
-            StorageReader.ValueMapper<T> mapper
+            ValueMapper<T> mapper
     ) throws ExecutionException, InterruptedException {
         ReadOptions use = (opts != null) ? opts : defaultReadOpts;
 
@@ -365,7 +353,7 @@ public class BigQueryStorageReader implements StorageReader, AutoCloseable {
             String table,
             String column,
             ReadOptions opts,
-            StorageReader.ValueMapper<T> mapper,
+            ValueMapper<T> mapper,
             BatchSink<T> sink
     ) throws Exception {
         ReadOptions use = (opts != null) ? opts : defaultReadOpts;

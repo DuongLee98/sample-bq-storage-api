@@ -21,7 +21,7 @@ public final class AvroUtils {
         Decoder decoder = DecoderFactory.get().binaryDecoder(payload, null);
         GenericDatumReader<GenericRecord> reader = new GenericDatumReader<>(schema);
 
-        List<GenericRecord> out = new ArrayList<>((int)Math.min(rc, Integer.MAX_VALUE));
+        List<GenericRecord> out = new ArrayList<>();
         for (long i = 0; i < rc; i++) {
             out.add(reader.read(null, decoder));
         }

@@ -1,5 +1,7 @@
 package bqstorageapi.config;
 
+import com.google.api.gax.rpc.StatusCode;
+
 import java.time.Duration;
 import java.util.Collections;
 import java.util.EnumSet;
@@ -10,22 +12,13 @@ import java.util.Set;
  * Bạn sẽ map sang gax RetrySettings nếu muốn.
  */
 public final class RetryConfig {
-    /** Tập mã lỗi được phép retry (trừu tượng hoá, không phụ thuộc GAX). */
-    public enum Code {
-        UNAVAILABLE,
-        DEADLINE_EXCEEDED,
-        ABORTED,
-        INTERNAL,
-        RESOURCE_EXHAUSTED,
-        // mở rộng nếu cần: CANCELLED, UNKNOWN...
-    }
 
     public final int maxAttempts;               // tổng số lần thử (tính cả lần đầu)
     public final Duration initialBackoff;       // backoff khởi đầu
     public final double backoffMultiplier;      // nhân theo exponential
     public final Duration maxBackoff;           // trần backoff
     public final Duration overallTimeout;       // timeout tổng (null => không khống chế ở đây)
-    public final Set<Code> retryableCodes;      // các mã lỗi cho phép retry
+    public final Set<StatusCode.Code> retryableCodes; // các mã lỗi cho phép retry
     public final boolean jitter;                // có dùng jitter hay không
 
     private RetryConfig(Builder b) {
@@ -45,10 +38,13 @@ public final class RetryConfig {
         private Duration initialBackoff = Duration.ofMillis(200);
         private double backoffMultiplier = 2.0;
         private Duration maxBackoff = Duration.ofSeconds(10);
-        private Duration overallTimeout = Duration.ofMinutes(10);
-        private Set<Code> retryableCodes = EnumSet.of(
-                Code.UNAVAILABLE, Code.DEADLINE_EXCEEDED,
-                Code.ABORTED, Code.INTERNAL, Code.RESOURCE_EXHAUSTED
+        private Duration overallTimeout = null ;               // không khống chế
+        private Set<StatusCode.Code> retryableCodes = EnumSet.of(
+                StatusCode.Code.UNAVAILABLE,
+                StatusCode.Code.DEADLINE_EXCEEDED,
+                StatusCode.Code.ABORTED,
+                StatusCode.Code.INTERNAL,
+                StatusCode.Code.RESOURCE_EXHAUSTED
         );
         private boolean jitter = true;
 
@@ -57,7 +53,7 @@ public final class RetryConfig {
         public Builder backoffMultiplier(double v) { this.backoffMultiplier = v; return this; }
         public Builder maxBackoff(Duration v) { this.maxBackoff = v; return this; }
         public Builder overallTimeout(Duration v) { this.overallTimeout = v; return this; }
-        public Builder retryableCodes(Set<Code> v) { this.retryableCodes = v; return this; }
+        public Builder retryableCodes(Set<StatusCode.Code> v) { this.retryableCodes = v; return this; }
         public Builder jitter(boolean v) { this.jitter = v; return this; }
 
         public RetryConfig build() { return new RetryConfig(this); }

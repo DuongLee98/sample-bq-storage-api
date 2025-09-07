@@ -1,4 +1,4 @@
-package bqstorageapi.core.reader;
+package bqstorageapi.handler;
 
 import org.apache.avro.generic.GenericRecord;
 import java.util.List;

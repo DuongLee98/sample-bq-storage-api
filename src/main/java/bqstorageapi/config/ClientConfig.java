@@ -22,7 +22,7 @@ public final class ClientConfig {
     public static final class Builder {
         private String projectId;
         private String dataset;
-        private String location = "US";
+        private String location;
         private Path serviceAccountJson; // nếu null => Application Default Credentials
 
         public Builder projectId(String v) { this.projectId = v; return this; }

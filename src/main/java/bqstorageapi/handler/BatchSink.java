@@ -1,4 +1,4 @@
-package bqstorageapi.sink;
+package bqstorageapi.handler;
 
 import java.util.List;
 
